@@ -1,70 +1,93 @@
 package data.source
 
-import com.github.kwhat.jnativehook.GlobalScreen
-import com.github.kwhat.jnativehook.keyboard.NativeKeyEvent
-import com.github.kwhat.jnativehook.keyboard.NativeKeyListener
+import com.sun.jna.Pointer
+import com.sun.jna.platform.win32.User32
+import com.sun.jna.platform.win32.WinDef
+import com.sun.jna.platform.win32.WinUser
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
-import java.util.logging.Level
-import java.util.logging.Logger
+import kotlinx.coroutines.withContext
 
 class GlobalHotkeyManager(private val scope: CoroutineScope) {
 
-    private val _hotkeyEvents = MutableSharedFlow<Unit>(
-        replay = 0,
-        extraBufferCapacity = 1
-    )
+    private val _hotkeyEvents = MutableSharedFlow<Unit>(replay = 0, extraBufferCapacity = 1)
     val hotkeyEvents: SharedFlow<Unit> = _hotkeyEvents.asSharedFlow()
 
-    private val keyListener = object : NativeKeyListener {
-        override fun nativeKeyPressed(e: NativeKeyEvent) {
-            // Проверяем Ctrl+Shift+V через битовые маски (несколько модификаторов могут быть активны одновременно)
-            val isCtrl = (e.modifiers and NativeKeyEvent.CTRL_MASK) != 0
-            val isShift = (e.modifiers and NativeKeyEvent.SHIFT_MASK) != 0
-            val isV = e.keyCode == NativeKeyEvent.VC_V
+    // Держим сильную ссылку на коллбэк: JNA хранит коллбэки по слабой ссылке
+    // и GC может удалить объект, если нет внешней ссылки, что приведёт к краху.
+    @Volatile private var hookHandle: WinUser.HHOOK? = null
 
-            if (isCtrl && isShift && isV) {
-                // Подавляем нативное событие — без этого Ctrl+Shift+V дойдёт до
-                // активного приложения (Chrome/Word воспринимают его как "вставить
-                // без форматирования") и вставка произойдёт ДО появления попапа.
-                runCatching { GlobalScreen.suppressEvent(e) }
-                    .onFailure { ex ->
-                        System.err.println("[GlobalHotkeyManager] suppressEvent failed: ${ex.message}")
+    private val exceptionHandler = CoroutineExceptionHandler { _, t ->
+        System.err.println("[GlobalHotkeyManager] ${t.message}")
+    }
+
+    private val hookProc = WinUser.LowLevelKeyboardProc { nCode, wParam, info ->
+        if (nCode >= 0) {
+            // Явно читаем поля структуры из нативной памяти
+            info.read()
+
+            val eventType = wParam.toInt()
+            if (eventType == WinUser.WM_KEYDOWN || eventType == WM_SYSKEYDOWN) {
+                if (info.vkCode == VK_V) {
+                    val ctrlDown  = User32.INSTANCE.GetAsyncKeyState(VK_CONTROL).toInt() and 0x8000 != 0
+                    val shiftDown = User32.INSTANCE.GetAsyncKeyState(VK_SHIFT).toInt()   and 0x8000 != 0
+
+                    if (ctrlDown && shiftDown) {
+                        scope.launch(exceptionHandler) { _hotkeyEvents.emit(Unit) }
+
+                        // Возвращаем ненулевое значение — Windows не передаёт событие
+                        // в очередь приложения (подавление), CallNextHookEx не вызываем.
+                        return@LowLevelKeyboardProc WinDef.LRESULT(1)
                     }
-
-                // nativeKeyPressed вызывается на нативном треде JNativeHook.
-                // scope.launch переводит эмиссию в корутинный диспетчер.
-                scope.launch { _hotkeyEvents.emit(Unit) }
+                }
             }
         }
 
-        override fun nativeKeyReleased(e: NativeKeyEvent) = Unit
-        override fun nativeKeyTyped(e: NativeKeyEvent) = Unit
+        // Событие не наше — передаём дальше по цепочке хуков
+        User32.INSTANCE.CallNextHookEx(
+            hookHandle,
+            nCode,
+            wParam,
+            WinDef.LPARAM(Pointer.nativeValue(info.pointer))
+        )
     }
 
     fun register() {
-        // Подавляем verbose-логирование JNativeHook до вызова registerNativeHook()
-        val logger = Logger.getLogger(GlobalScreen::class.java.`package`.name)
-        logger.level = Level.OFF
-        logger.useParentHandlers = false
-
-        runCatching {
-            GlobalScreen.registerNativeHook()
-            GlobalScreen.addNativeKeyListener(keyListener)
-        }.onFailure { e ->
-            System.err.println("[GlobalHotkeyManager] Не удалось зарегистрировать хук: ${e.message}")
+        // WH_KEYBOARD_LL требует, чтобы устанавливающий поток качал Win32-сообщения.
+        // Swing EDT на Windows делает это через JNI, поэтому используем Dispatchers.Main.
+        scope.launch(exceptionHandler) {
+            withContext(Dispatchers.Main) {
+                runCatching {
+                    hookHandle = User32.INSTANCE.SetWindowsHookEx(
+                        WinUser.WH_KEYBOARD_LL,
+                        hookProc,
+                        null,
+                        0
+                    ) ?: error("SetWindowsHookEx вернул null")
+                }.onFailure { e ->
+                    System.err.println("[GlobalHotkeyManager] Ошибка регистрации хука: ${e.message}")
+                }
+            }
         }
     }
 
     fun dispose() {
         runCatching {
-            GlobalScreen.removeNativeKeyListener(keyListener)
-            GlobalScreen.unregisterNativeHook()
+            hookHandle?.let { User32.INSTANCE.UnhookWindowsHookEx(it) }
         }.onFailure { e ->
-            System.err.println("[GlobalHotkeyManager] Не удалось снять хук: ${e.message}")
+            System.err.println("[GlobalHotkeyManager] Ошибка снятия хука: ${e.message}")
         }
+    }
+
+    companion object {
+        private const val VK_V       = 0x56
+        private const val VK_CONTROL = 0x11
+        private const val VK_SHIFT   = 0x10
+        private const val WM_SYSKEYDOWN = 0x0104
     }
 }
