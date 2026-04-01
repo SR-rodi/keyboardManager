@@ -27,6 +27,14 @@ class GlobalHotkeyManager(private val scope: CoroutineScope) {
             val isV = e.keyCode == NativeKeyEvent.VC_V
 
             if (isCtrl && isShift && isV) {
+                // Подавляем нативное событие — без этого Ctrl+Shift+V дойдёт до
+                // активного приложения (Chrome/Word воспринимают его как "вставить
+                // без форматирования") и вставка произойдёт ДО появления попапа.
+                runCatching { GlobalScreen.suppressEvent(e) }
+                    .onFailure { ex ->
+                        System.err.println("[GlobalHotkeyManager] suppressEvent failed: ${ex.message}")
+                    }
+
                 // nativeKeyPressed вызывается на нативном треде JNativeHook.
                 // scope.launch переводит эмиссию в корутинный диспетчер.
                 scope.launch { _hotkeyEvents.emit(Unit) }

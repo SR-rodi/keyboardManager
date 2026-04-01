@@ -28,6 +28,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -53,6 +54,7 @@ import java.awt.event.WindowEvent
 import java.awt.event.WindowFocusListener
 import java.text.SimpleDateFormat
 import java.util.Date
+import kotlinx.coroutines.delay
 
 @Composable
 fun PopupWindow(
@@ -92,11 +94,23 @@ fun PopupWindow(
         resizable = false,
         focusable = true
     ) {
+        // Guard: не закрывать попап по потере фокуса первые 300мс.
+        // Без задержки возможна гонка: ОС присваивает фокус новому окну не мгновенно,
+        // и windowLostFocus может сработать раньше, чем windowGainedFocus — попап
+        // закроется сразу после открытия.
+        val dismissOnFocusLoss = remember { mutableStateOf(false) }
+        LaunchedEffect(Unit) {
+            delay(300)
+            dismissOnFocusLoss.value = true
+        }
+
         // Закрываем попап при потере фокуса окна (клик вне окна)
         DisposableEffect(Unit) {
             val focusListener = object : WindowFocusListener {
                 override fun windowGainedFocus(e: WindowEvent?) = Unit
-                override fun windowLostFocus(e: WindowEvent?) = onDismiss()
+                override fun windowLostFocus(e: WindowEvent?) {
+                    if (dismissOnFocusLoss.value) onDismiss()
+                }
             }
             window.addWindowFocusListener(focusListener)
             onDispose { window.removeWindowFocusListener(focusListener) }
